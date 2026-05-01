@@ -1,248 +1,119 @@
 # Appliance Smart Control
 
 A Home Assistant **blueprint** that pauses long-running appliances
-(dishwasher, washing machine, tumble dryer) shortly before sunset when
-household solar export drops below a threshold, so the rest of the cycle
-runs on free solar the next day instead of grid power.
+(washing machine, tumble dryer, dishwasher) whenever live solar
+production drops below a threshold, and resumes them once production
+returns. One simple rule handles both "started too early in the
+morning" and "still running into the evening".
 
-Built around **LG ThinQ** entities but works with any appliance that
-exposes a status sensor and either an operation `select` or a power
-`switch`.
+Built around **LG ThinQ** entities but works with anything exposing a
+status sensor and either an operation `select` or a power `switch`.
 
 ---
 
-## How it works (plain English)
+## How it works
 
-Picture a washing machine that started at 16:30 and still has 90 minutes
-left. Sunset is at 17:45. Without help, the second half of the cycle
-runs on grid power after dark. This blueprint watches for that and, if
-your solar is already fading, hits "pause" before sunset and resumes
-the cycle the next morning when the sun is back.
+A live solar production sensor (e.g. `sensor.power_production_now`) is
+the single source of truth.
 
-### The basic idea
+- If the appliance is **running** and production has been **below
+  `production_threshold`** (default 1000 W) for `dwell_minutes`
+  (default 5), pause it.
+- If the appliance is **paused-by-us** and production has been **above
+  the threshold** for `dwell_minutes`, resume it.
+- If the user manually resumes or the cycle ends, the paused-by-solar
+  flag clears itself.
 
-The automation re-evaluates whenever something interesting happens —
-the appliance's state changes, grid export swings, the sun sets, or a
-5-minute safety-net tick fires. On each evaluation it asks:
+That's it. No sunset windows, no forecasts, no time-of-day rules.
+Production reading drives everything.
 
-1. **Is the appliance actually running?** (looks at the status sensor)
-2. **Are we close to sunset?** (within `lead_minutes`, default 60)
-3. **Is solar export already low?** (below `export_threshold`, default
-   300 W — meaning we're not exporting much, so the appliance is mostly
-   pulling from the grid)
-4. **Has export been low for a while?** (`pause_dwell` minutes — so a
-   passing cloud doesn't trigger a pause)
-5. **Is there enough cycle left to bother?** (between
-   `min_remaining_minutes` and `max_remaining_minutes` — skip if it's
-   nearly done OR has barely started)
-6. **Is it smart to pause right now?** A series of "actually, never
-   mind" gates (all optional):
-   - Will today's remaining solar finish the cycle anyway? → don't pause
-   - Is tomorrow forecast to be cloudy/rainy? → don't pause (no point
-     deferring to a bad solar day)
-   - Is the grid currently cheap? → don't pause (cheap grid beats
-     waiting)
-   - Does the home battery have plenty of charge? → don't pause (the
-     battery will cover the appliance)
+### Anti-flap
 
-If all of that says "yes, pause it" — it does. It also flips an
-`input_boolean` flag to remember **"I paused this, the user didn't"**,
-so it never tries to auto-resume something you paused yourself.
+Pause and resume both use Home Assistant's `numeric_state` trigger with
+a `for:` clause, so a passing cloud (or a brief sun spike at dawn) won't
+cause toggling.
 
-### The next day: resuming
+### Optional "almost finished" guard
 
-You pick one of three resume strategies:
+If you provide `remaining_time_sensor`, the pause is skipped when fewer
+than `min_remaining_minutes` are left — no point pausing something
+that's nearly done.
 
-- **`auto_export`** — the next morning, once solar export is back above
-  the threshold and stays there for `resume_dwell` minutes, resume
-  automatically.
-- **`fixed_time`** — resume at a fixed time-of-day you've configured
-  (e.g. 09:00).
-- **`manual`** — just notify; you press resume yourself.
+### Optional Remote Start gate
 
-Two safety rails apply to all auto-resume strategies:
-
-- It won't resume before `earliest_resume_hour` (default 08:00) — no
-  starting the dryer at 04:00 because of a sensor glitch.
-- It won't resume within `min_pause_hours` of the pause (default 4 h) —
-  no instant "pause then immediately resume" loops.
-- It won't resume twice on the same day (if you've configured the
-  optional `last_resume_date` helper).
-
-### What about appliances I can't control?
-
-For the dishwasher (LG ThinQ exposes no control entities), use
-`pause_mode: notify_only`. The blueprint just sends a notification
-saying "you should probably pause this now" — and importantly does
-**not** flip the paused-by-solar flag, since it didn't actually do
-anything. If you then pause it manually, that's your call.
-
-### What if I manually resume / the cycle just ends?
-
-If the paused-by-solar flag is on but the appliance is no longer paused
-AND no longer running (i.e. it finished or you turned it off), the flag
-clears itself. So the system never gets "stuck" thinking it's still
-holding a pause.
+If you provide `remote_start_sensor` (e.g.
+`binary_sensor.dryer_remote_start`), the blueprint won't try to send
+pause/resume commands while Remote Start is OFF — the LG API would
+reject them anyway.
 
 ---
 
 ## Pause modes
 
-LG ThinQ exposes different controls per appliance:
+| Appliance       | Mode             | Why                                         |
+| --------------- | ---------------- | ------------------------------------------- |
+| Washing machine | `select_option`  | `select.washer_operation` → `stop` to pause |
+| Tumble dryer    | `select_option`  | `select.dryer_operation` → `stop` to pause  |
+| Dishwasher      | `notify_only`    | LG ThinQ exposes no control entities        |
 
-| Appliance       | Mode             | Why                                          |
-| --------------- | ---------------- | -------------------------------------------- |
-| Washing machine | `select_option`  | `select.washer_operation` → `stop` to pause  |
-| Tumble dryer    | `select_option`  | `select.dryer_operation` → `stop` to pause   |
-| Dishwasher      | `notify_only`    | LG ThinQ exposes no control entities         |
+> LG ThinQ washer/dryer operation options are `start`, `stop`,
+> `power_off`, `wake_up`. Use **`stop`** to pause and **`start`** to
+> resume. Never use `power_off` to pause — that ends the cycle.
 
-> **LG ThinQ select options** for both washer and dryer are
-> `start`, `stop`, `power_off`, `wake_up`. There is no `pause` option —
-> `stop` is what pauses a running cycle, and `start` resumes it.
-> Do **not** use `power_off` to pause: it ends the cycle.
+> ⚠️ `switch_off` is dryer-only at best, and most appliances do **not**
+> auto-resume after a power cycle. Prefer `select_option` whenever
+> available.
 
-> ⚠️ Do **not** use `switch_off` for washers or dishwashers — cutting
-> power mid-cycle can leave water in the drum or trip the appliance.
-> Even on the dryer, be aware that **most appliances do not auto-resume
-> their program after a cold power cycle** — you may have to restart it
-> manually. Prefer `select_option` whenever the appliance supports it.
+> ⚠️ **LG dryer sleep mode**: about 10 min after pausing, the dryer's
+> status changes to `sleep` and the API rejects further commands. This
+> simple blueprint won't recover it. If a pause is likely to last more
+> than ~10 min, expect that the dryer needs a manual tap on the panel
+> to resume. (A keepalive workaround is possible but not in this
+> simplified version — re-introduce later if needed.)
 
 ---
 
-## Helpers
+## Required helpers
 
-### Required (per appliance)
+### Per appliance
 
 - `input_boolean.<appliance>_paused_by_solar` — flag the blueprint sets
-  when **it** paused the appliance (so it doesn't resume something you
-  paused yourself).
+  when it pauses the appliance, so it never resumes something the user
+  paused manually.
 
-### Required (shared, one set)
+### Shared (one-off)
 
-- `input_boolean.appliance_smart_control_enable` — master enable toggle.
+- `input_boolean.appliance_smart_control_enable` — master enable.
 
-### Optional but recommended (per appliance)
+### YAML form
 
-These improve robustness — especially across HA restarts. Each can be
-left blank and the blueprint will fall back to less precise behaviour.
+```yaml
+input_boolean:
+  appliance_smart_control_enable:
+    name: Appliance Smart Control enabled
+    icon: mdi:solar-power
+  washer_paused_by_solar:
+    name: Washer paused by solar
+    icon: mdi:washing-machine
+  dryer_paused_by_solar:
+    name: Dryer paused by solar
+    icon: mdi:tumble-dryer
+  dishwasher_paused_by_solar:
+    name: Dishwasher paused by solar
+    icon: mdi:dishwasher
+```
 
-- `input_datetime.<appliance>_pause_timestamp` (date + time) —
-  exact moment of last pause. More reliable than reading
-  `last_changed` off the boolean (which resets on restart).
-- `input_datetime.<appliance>_low_export_since` (date + time) —
-  records when export first dropped below the threshold. Required for
-  `pause_dwell` to actually do anything.
-- `input_datetime.<appliance>_last_resume` (date + time) —
-  remembers when an auto-resume last fired, so it can't fire twice
-  on the same day.
-
-### Required if using keepalive (per appliance)
-
-- `input_datetime.<appliance>_last_keepalive` (date + time) —
-  records the last time a keepalive command was sent. Without it the
-  blueprint can't space taps out, so keepalive is auto-disabled.
-
-### Optional (only for `fixed_time` resume)
-
-- `input_datetime.<appliance>_solar_resume_time` (time only).
+After editing: **Developer Tools → YAML → Reload Input Booleans**.
 
 ---
 
-## Smarter gating sensors (all optional)
+## Tunables
 
-Provide whichever you have; the blueprint will use them to *avoid*
-pausing when pausing wouldn't actually save anything.
-
-| Input                              | What it does                                         |
-| ---------------------------------- | ---------------------------------------------------- |
-| `solar_forecast_remaining_sensor`  | kWh of solar still expected today (Forecast.Solar / Solcast). If it covers the rest of the cycle, skip pause. |
-| `tomorrow_forecast_sensor`         | Expected kWh tomorrow. If below `min_tomorrow_kwh`, skip pause. |
-| `tariff_sensor`                    | Current grid import price. If below `cheap_grid_threshold`, skip pause. |
-| `battery_soc_sensor`               | Home battery SOC %. If at or above `battery_min_soc`, skip pause. *(Future-proof — set later when you add a battery.)* |
-| `appliance_power_w`                | Nominal draw in watts. Used to estimate cycle kWh in notifications and forecast comparison. |
-
----
-
-## Keepalive (defeating LG's auto-power-off)
-
-LG ThinQ washers and dryers typically auto-power-off **after about
-4 hours in pause**, which destroys the cycle long before tomorrow's
-solar arrives. Keepalive solves this by periodically tapping the
-operation select with a benign command (`wake_up`) to reset the
-appliance's idle countdown.
-
-### How to enable
-
-1. Set `keepalive_enabled: true`.
-2. Provide an `input_datetime` for `last_keepalive` (date + time).
-3. Leave `keepalive_option: wake_up` unless you've verified another
-   value is safer for your firmware.
-4. Tune `keepalive_interval_hours` — default 3 h, must be **shorter**
-   than your appliance's auto-power-off timeout. LG ThinQ ≈ 4 h, so
-   3 h leaves a 1 h safety margin.
-
-### Guardrails (built in)
-
-- **Only fires with `pause_mode: select_option`** — has no effect for
-  `notify_only` or `switch_off`.
-- **Only fires while the status sensor is in a paused state.** If the
-  appliance has already powered off, keepalive does nothing.
-- **Only fires before `earliest_resume_hour`.** Once the resume window
-  opens, the resume branches take over.
-- **Never sends `start` or `power_off`.** The configurable option
-  defaults to `wake_up`; setting it to `start` would resume the
-  cycle immediately and is a misconfiguration.
-- **First keepalive is delayed** by `keepalive_interval_hours` from
-  the moment of pause (the pause itself seeds `last_keepalive`).
-
-### Failure detection
-
-If keepalive doesn't reset your firmware's countdown (or you didn't
-configure it), the appliance will eventually power itself off. The
-blueprint detects this via the `timeout_states` input (default
-`power_off,off,end,initial`):
-
-- If `paused_by_solar` is on AND status enters one of those states,
-  it sends a **"cycle lost"** notification and clears the flag.
-- You'll know to manually restart the appliance — no silent failure.
-
-### Should I enable it?
-
-- **Washer / dryer with `select_option`:** yes, especially in winter
-  when sunset → sunrise is 14+ hours.
-- **Dishwasher (`notify_only`):** no — there's nothing to keep alive,
-  and HA can't control the dishwasher anyway.
-- **Anything on `switch_off`:** no — power is already off.
-
----
-
-## Tunables you'll most likely touch
-
-| Input                     | Default | Meaning                                      |
-| ------------------------- | ------- | -------------------------------------------- |
-| `lead_minutes`            | 60      | How early before sunset the pause window opens. |
-| `pause_window_end_offset` | 5       | How long after sunset the window stays open. |
-| `export_threshold`        | 300 W   | Below this = "we're importing significantly". |
-| `pause_dwell`             | 5 min   | Anti-flap on cloud cover.                    |
-| `min_remaining_minutes`   | 15      | Don't pause cycles that are nearly done.     |
-| `max_remaining_minutes`   | 240     | Don't pause cycles that just started.        |
-| `resume_dwell`            | 10 min  | Export must hold above threshold this long before auto-resume. |
-| `earliest_resume_hour`    | 8       | No auto-resume before this hour.             |
-| `min_pause_hours`         | 4       | No auto-resume sooner than this after pause. |
-
----
-
-## Verifying your `select.*_operation` options
-
-For reference, on a current LG ThinQ install the operation selects
-expose:
-
-- `select.washer_operation`: `start`, `stop`, `power_off`, `wake_up`
-- `select.dryer_operation`:  `start`, `stop`, `power_off`, `wake_up`
-
-If yours differ, open **Developer Tools → States**, look at the
-`options` attribute on the select entity, and update the
-`pause_option` / `resume_option` blueprint inputs accordingly.
+| Input                    | Default | Meaning                                  |
+| ------------------------ | ------- | ---------------------------------------- |
+| `production_threshold`   | 1000 W  | Pause below, resume above.               |
+| `dwell_minutes`          | 5       | Anti-flap: must be sustained this long.  |
+| `min_remaining_minutes`  | 10      | Don't pause cycles nearly done (only used if `remaining_time_sensor` is set). |
 
 ---
 
@@ -257,58 +128,55 @@ automation per appliance.
 
 ## Example: washer instance
 
+- Master enable: `input_boolean.appliance_smart_control_enable`
 - Status sensor: `sensor.washer_current_status`
-- Remaining time: `sensor.washer_remaining_time`
+- Remaining time: `sensor.washer_remaining_time` *(optional)*
+- Production sensor: `sensor.power_production_now`
+- Production threshold: `1000`
+- Dwell minutes: `5`
 - Pause mode: `select_option`
 - Operation select: `select.washer_operation`
 - Pause option: `stop`
 - Resume option: `start`
 - Paused flag: `input_boolean.washer_paused_by_solar`
-- Pause timestamp: `input_datetime.washer_pause_timestamp`
-- Low-export since: `input_datetime.washer_low_export_since`
-- Last resume: `input_datetime.washer_last_resume`
-- Resume strategy: `auto_export`
-- Appliance power: `2000` W
-- Keepalive enabled: `true`
-- Keepalive option: `wake_up`
-- Keepalive interval: `3` h
-- Last keepalive: `input_datetime.washer_last_keepalive`
+- Notify: `notify.mobile_app_<your_phone>`
+- Friendly name: `Washer`
+
+## Example: dryer instance
+
+- As washer, but:
+  - Status sensor: `sensor.dryer_current_status`
+  - `paused_states`: `pause,sleep` *(treat sleep as still paused)*
+  - Operation select: `select.dryer_operation`
+  - Paused flag: `input_boolean.dryer_paused_by_solar`
+  - Remote-start sensor: `binary_sensor.dryer_remote_start`
 
 ## Example: dishwasher instance
 
+- Master enable: `input_boolean.appliance_smart_control_enable`
 - Status sensor: `sensor.dishwasher_current_status`
-- Remaining time: `sensor.dishwasher_remaining_time`
+- Production sensor: `sensor.power_production_now`
 - Pause mode: `notify_only`
-- Notify service: `notify.mobile_app_<your_phone>`
-- Resume strategy: `manual`
-- Appliance power: `1800` W
+- Notify: `notify.mobile_app_<your_phone>`
+- Friendly name: `Dishwasher`
+- Paused flag: `input_boolean.dishwasher_paused_by_solar`
 
-The blueprint will notify you to suggest pausing it manually; once the
-appliance leaves the running/paused state, no flag needs clearing
-(notify-only never sets the flag in the first place).
+You'll get a notification suggesting you pause it manually.
 
 ---
 
 ## Troubleshooting
 
-- **"Nothing pauses, ever."** Check the master enable boolean is on,
-  the appliance status sensor is in your `running_states` list, and the
-  enable conditions evaluate true in **Developer Tools → Template**.
-- **"It pauses on a cloud."** Increase `pause_dwell` (and make sure
-  `low_export_since` helper is configured — without it, dwell is 0).
-- **"It resumed at 4 a.m."** Set `earliest_resume_hour` higher and
-  configure `last_resume_date` so a second same-day resume can't fire.
-- **"It paused something I'd already manually paused."** Shouldn't
-  happen — the paused-by-solar flag gates this. If it does, you may
-  have flipped the boolean by hand; turn it off and the next manual
-  pause will be respected.
-- **"I got a 'cycle lost' notification."** The appliance's internal
-  timeout fired before keepalive could refresh it (or keepalive isn't
-  enabled). Lower `keepalive_interval_hours` (e.g. from 3 to 2) and
-  verify your firmware actually responds to `wake_up`. If `wake_up`
-  doesn't reset the countdown on your unit, there's no software fix —
-  the appliance hardware enforces the timeout.
-- **"Keepalive seems to do nothing."** Check `keepalive_enabled` is
-  on, `pause_mode` is `select_option`, and `last_keepalive` helper is
-  configured (without it keepalive is silently disabled to avoid
-  spamming the appliance).
+- **Nothing happens.** Check the master enable boolean is on, and the
+  status sensor's current state is in your `running_states` list.
+  Verify in Developer Tools → Template by pasting
+  `{{ states('sensor.washer_current_status') }}`.
+- **It's flapping.** Increase `dwell_minutes`.
+- **It paused near the end of a cycle.** Configure
+  `remaining_time_sensor` and `min_remaining_minutes`.
+- **Resume command was rejected.** If you have an LG washer/dryer with
+  Remote Start, configure `remote_start_sensor` so the blueprint won't
+  try to send commands while Remote Start is disarmed.
+- **Dryer didn't recover from `sleep`.** Known LG limitation in the
+  simplified version. Either resume manually, or re-introduce keepalive
+  logic (not included here).
