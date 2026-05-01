@@ -14,18 +14,28 @@ blueprint:
 
     Logic (evaluated every minute):
       • If the appliance is running AND now is within `lead_minutes`
-        of sunset AND grid export < `export_threshold` AND remaining
-        cycle time > `min_remaining_minutes`, pause it and remember
-        that WE paused it.
+        of sunset AND grid export < `export_threshold` (sustained for
+        `pause_dwell` minutes) AND remaining cycle time is in
+        [`min_remaining_minutes`, `max_remaining_minutes`], pause it
+        and remember that WE paused it.
+      • Smarter "should we even bother?" gates (all optional):
+          - skip pause if remaining solar forecast today covers the
+            rest of the cycle
+          - skip pause if tomorrow's forecast is poor (no point
+            deferring to a cloudy day)
+          - skip pause if grid is currently cheap
+          - skip pause if home battery has headroom (future-proof)
       • The next day, optionally auto-resume:
-          - `auto_export`  : when export ≥ threshold again
+          - `auto_export`  : when export ≥ threshold again (sustained)
           - `fixed_time`   : at a configured time
           - `manual`       : only notify, you press resume yourself
+        Auto-resume never fires before `earliest_resume_hour`.
       • Pause action is configurable per appliance:
           - `select_option`: call select.select_option on
             `select.*_operation` with the configured value (LG dryer/washer)
-          - `switch_off`   : turn off a power switch (DRYER ONLY — do NOT
-            cut power to washers/dishwashers mid-cycle)
+          - `switch_off`   : turn off a power switch (DRYER ONLY — and
+            note that most appliances will NOT resume the program after
+            a cold power cycle; treat this as "abort, restart manually")
           - `notify_only`  : send a notification, do nothing else
             (use for the LG dishwasher which is read-only in HA)
 
@@ -37,6 +47,14 @@ blueprint:
       • input_boolean.<appliance>_paused_by_solar
         — flag the blueprint sets when IT paused the appliance, so it
         only resumes things it paused itself.
+
+    Optional helpers (per appliance — improve robustness if provided):
+      • input_datetime.<appliance>_pause_timestamp  (date+time)
+        — exact moment of last pause; used for resume dwell/min-wait.
+      • input_datetime.<appliance>_low_export_since (date+time)
+        — first moment export went below threshold; used for pause dwell.
+      • input_datetime.<appliance>_last_resume      (date+time)
+        — date of last auto-resume; used to avoid double-resume.
 
   domain: automation
   source_url: https://github.com/andre-sam/appliance-smart-control/blob/main/appliance-smart-control.yaml
@@ -103,13 +121,45 @@ blueprint:
           unit_of_measurement: min
           mode: box
 
+    max_remaining_minutes:
+      name: Maximum remaining minutes to bother pausing
+      description: >
+        If more than this many minutes are left, the cycle has likely
+        only just started — don't bother pausing (it'd be a long pause
+        and you may have meant `delayed_start`). Set high (e.g. 999) to
+        disable this gate.
+      default: 240
+      selector:
+        number:
+          min: 30
+          max: 999
+          unit_of_measurement: min
+          mode: box
+
+    appliance_power_w:
+      name: Appliance nominal power draw (W)
+      description: >
+        Approximate power consumption while running. Used in
+        notifications to estimate energy saved, and (if a solar
+        forecast is configured) to decide if remaining solar covers
+        the rest of the cycle.
+      default: 2000
+      selector:
+        number:
+          min: 0
+          max: 5000
+          step: 50
+          unit_of_measurement: W
+          mode: box
+
     # ---------- Pause action ----------
     pause_mode:
       name: How to pause this appliance
       description: >
         - `select_option`: calls `select.select_option` on the configured
           operation select (LG dryer & washer).
-        - `switch_off`: turns off a power switch — DRYER ONLY.
+        - `switch_off`: turns off a power switch — DRYER ONLY, and most
+          appliances will NOT auto-resume after a cold power cycle.
         - `notify_only`: sends a notification, takes no action (LG
           dishwasher which has no controllable entities in HA).
       default: notify_only
@@ -154,7 +204,9 @@ blueprint:
       name: "Power switch (for `switch_off` mode — DRYER ONLY)"
       description: >
         e.g. `switch.dryer_power`. Ignored unless `pause_mode` is
-        `switch_off`. Do NOT use this for washers or dishwashers.
+        `switch_off`. Do NOT use this for washers or dishwashers, and
+        be aware that turning power back on does NOT resume the
+        program on most appliances — the user will need to restart it.
       default:
       selector:
         entity:
@@ -166,10 +218,23 @@ blueprint:
         Per-appliance input_boolean the blueprint flips ON when it
         pauses the appliance, and OFF after a successful resume. Lets
         the blueprint distinguish "I paused this" from "the user
-        paused this manually".
+        paused this manually". NOTE: in `notify_only` mode the flag
+        stays OFF (we didn't actually do anything to pause it).
       selector:
         entity:
           domain: input_boolean
+
+    pause_timestamp:
+      name: "Pause timestamp helper (input_datetime, optional)"
+      description: >
+        Optional input_datetime (with date AND time) where the
+        blueprint records when it paused the appliance. Survives HA
+        restarts and is more reliable than `last_changed`. Leave blank
+        to fall back to the paused-flag's `last_changed`.
+      default: ""
+      selector:
+        entity:
+          domain: input_datetime
 
     # ---------- Solar / sunset ----------
     export_sensor:
@@ -196,7 +261,7 @@ blueprint:
       name: Export threshold (W)
       description: >
         If grid export is BELOW this value as sunset approaches, the
-        appliance gets paused.
+        appliance gets paused (after `pause_dwell`).
       default: 300
       selector:
         number:
@@ -205,6 +270,33 @@ blueprint:
           step: 50
           unit_of_measurement: W
           mode: box
+
+    pause_dwell:
+      name: Pause dwell (minutes)
+      description: >
+        Export must stay below the threshold this long before pausing,
+        to avoid pausing on a passing cloud. Requires the optional
+        `low_export_since` helper to be configured; otherwise this is
+        treated as 0.
+      default: 5
+      selector:
+        number:
+          min: 0
+          max: 60
+          unit_of_measurement: min
+          mode: box
+
+    low_export_since:
+      name: "Low-export timestamp helper (input_datetime, optional)"
+      description: >
+        Optional input_datetime (with date AND time) where the
+        blueprint records the first moment export went below the
+        threshold. Used to enforce `pause_dwell`. Leave blank to
+        disable dwell.
+      default: ""
+      selector:
+        entity:
+          domain: input_datetime
 
     lead_minutes:
       name: Pause lead time before sunset (minutes)
@@ -216,6 +308,104 @@ blueprint:
           min: 0
           max: 240
           unit_of_measurement: min
+          mode: box
+
+    pause_window_end_offset:
+      name: Pause window end offset (minutes after sunset)
+      description: >
+        How many minutes after sunset the pause window stays open.
+        Set to 0 to close the window exactly at sunset.
+      default: 5
+      selector:
+        number:
+          min: 0
+          max: 60
+          unit_of_measurement: min
+          mode: box
+
+    # ---------- Smarter gating (all optional) ----------
+    solar_forecast_remaining_sensor:
+      name: "Remaining solar today (sensor, optional)"
+      description: >
+        Sensor reporting kWh of solar still expected today (e.g.
+        Forecast.Solar / Solcast `energy_production_today_remaining`).
+        If provided, the pause is SKIPPED when remaining solar is
+        enough to finish the cycle on the spot.
+      default: ""
+      selector:
+        entity:
+          domain: sensor
+
+    tomorrow_forecast_sensor:
+      name: "Tomorrow's solar forecast (sensor, optional)"
+      description: >
+        Sensor reporting expected kWh of solar tomorrow. If provided
+        and tomorrow's forecast is below `min_tomorrow_kwh`, the
+        pause is SKIPPED (no point deferring to a cloudy day).
+      default: ""
+      selector:
+        entity:
+          domain: sensor
+
+    min_tomorrow_kwh:
+      name: Minimum tomorrow forecast (kWh) to allow pausing
+      description: >
+        Used only when `tomorrow_forecast_sensor` is set.
+      default: 5
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.5
+          unit_of_measurement: kWh
+          mode: box
+
+    tariff_sensor:
+      name: "Current grid price sensor (optional)"
+      description: >
+        Sensor reporting current grid import price (any unit). If
+        provided and the value is below `cheap_grid_threshold`, the
+        pause is SKIPPED (cheap grid beats waiting).
+      default: ""
+      selector:
+        entity:
+          domain: sensor
+
+    cheap_grid_threshold:
+      name: Cheap-grid threshold
+      description: >
+        If `tariff_sensor` < this, skip pause. Units must match the
+        tariff sensor (e.g. p/kWh or €/kWh).
+      default: 0
+      selector:
+        number:
+          min: -100
+          max: 100
+          step: 0.01
+          mode: box
+
+    battery_soc_sensor:
+      name: "Home battery SOC sensor (optional, future-proof)"
+      description: >
+        Battery state-of-charge in %. If provided and SOC is at or
+        above `battery_min_soc`, the pause is SKIPPED — the battery
+        will cover the appliance from stored solar.
+      default: ""
+      selector:
+        entity:
+          domain: sensor
+
+    battery_min_soc:
+      name: Minimum battery SOC to skip pause (%)
+      description: >
+        Used only when `battery_soc_sensor` is set.
+      default: 80
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
           mode: box
 
     # ---------- Resume ----------
@@ -252,7 +442,45 @@ blueprint:
       description: >
         Time-of-day input_datetime; the appliance is resumed at or after
         this time on the day after it was paused.
-      default:
+      default: ""
+      selector:
+        entity:
+          domain: input_datetime
+
+    earliest_resume_hour:
+      name: Earliest auto-resume hour (24h)
+      description: >
+        Auto-resume (any strategy) is suppressed before this hour, so
+        a stray sensor spike at 04:00 won't restart the appliance.
+      default: 8
+      selector:
+        number:
+          min: 0
+          max: 23
+          unit_of_measurement: h
+          mode: box
+
+    min_pause_hours:
+      name: Minimum pause duration (hours)
+      description: >
+        After pausing, wait at least this long before any auto-resume.
+        Prevents an immediate "resume" if export bounces back briefly.
+      default: 4
+      selector:
+        number:
+          min: 0
+          max: 24
+          step: 0.5
+          unit_of_measurement: h
+          mode: box
+
+    last_resume_date:
+      name: "Last-resume datetime helper (input_datetime, optional)"
+      description: >
+        Optional input_datetime (date AND time). Set when an
+        auto-resume fires; used to suppress a second auto-resume on
+        the same day. Leave blank to skip this guard.
+      default: ""
       selector:
         entity:
           domain: input_datetime
@@ -292,6 +520,8 @@ variables:
   paused_states: !input paused_states
   remaining_time_sensor: !input remaining_time_sensor
   min_remaining_minutes: !input min_remaining_minutes
+  max_remaining_minutes: !input max_remaining_minutes
+  appliance_power_w: !input appliance_power_w
 
   pause_mode: !input pause_mode
   operation_select: !input operation_select
@@ -299,20 +529,48 @@ variables:
   resume_option: !input resume_option
   power_switch: !input power_switch
   paused_flag: !input paused_flag
+  pause_timestamp: !input pause_timestamp
 
   export_sensor: !input export_sensor
   positive_when_exporting: !input positive_when_exporting
   export_threshold: !input export_threshold
+  pause_dwell: !input pause_dwell
+  low_export_since: !input low_export_since
   lead_minutes: !input lead_minutes
+  pause_window_end_offset: !input pause_window_end_offset
+
+  solar_forecast_remaining_sensor: !input solar_forecast_remaining_sensor
+  tomorrow_forecast_sensor: !input tomorrow_forecast_sensor
+  min_tomorrow_kwh: !input min_tomorrow_kwh
+  tariff_sensor: !input tariff_sensor
+  cheap_grid_threshold: !input cheap_grid_threshold
+  battery_soc_sensor: !input battery_soc_sensor
+  battery_min_soc: !input battery_min_soc
 
   resume_strategy: !input resume_strategy
   resume_dwell: !input resume_dwell
   resume_time: !input resume_time
+  earliest_resume_hour: !input earliest_resume_hour
+  min_pause_hours: !input min_pause_hours
+  last_resume_date: !input last_resume_date
 
   notify_service: !input notify_service
   appliance_friendly_name: !input appliance_friendly_name
 
-  # --- derived ---
+  # --- helpers: safe "is this entity configured?" checks ---
+  has_pause_ts:        "{{ (pause_timestamp        | string | length) > 0 }}"
+  has_low_export_ts:   "{{ (low_export_since       | string | length) > 0 }}"
+  has_last_resume:     "{{ (last_resume_date       | string | length) > 0 }}"
+  has_op_select:       "{{ (operation_select       | string | length) > 0 }}"
+  has_power_switch:    "{{ (power_switch           | string | length) > 0 }}"
+  has_resume_time:     "{{ (resume_time            | string | length) > 0 }}"
+  has_solar_remaining: "{{ (solar_forecast_remaining_sensor | string | length) > 0 }}"
+  has_tomorrow_fc:     "{{ (tomorrow_forecast_sensor | string | length) > 0 }}"
+  has_tariff:          "{{ (tariff_sensor          | string | length) > 0 }}"
+  has_battery:         "{{ (battery_soc_sensor     | string | length) > 0 }}"
+  has_notify:          "{{ (notify_service         | string | length) > 0 }}"
+
+  # --- derived: status ---
   status_raw: "{{ states(status_sensor) | lower }}"
   running_list: >
     {{ running_states.split(',') | map('trim') | map('lower') | list }}
@@ -326,36 +584,115 @@ variables:
   remaining_minutes: >
     {% set v = remaining_raw %}
     {% if v in ['unknown','unavailable','none',''] or v is none %}
-      0
+      {{ 0 }}
     {% elif ':' in v %}
-      {% set parts = v.split(':') | map('int') | list %}
+      {% set parts = v.split(':') | map('int', 0) | list %}
       {% if parts|length == 3 %}
-        {{ parts[0]*60 + parts[1] + (parts[2]/60) | round(0) }}
+        {{ (parts[0]*60 + parts[1] + (parts[2] / 60)) | round(0) | int }}
       {% elif parts|length == 2 %}
-        {{ parts[0]*60 + parts[1] }}
+        {{ (parts[0]*60 + parts[1]) | int }}
       {% else %}
-        0
+        {{ 0 }}
       {% endif %}
     {% else %}
-      {{ v | float(0) | round(0) }}
+      {{ v | float(0) | round(0) | int }}
     {% endif %}
 
   # export power normalised so positive = exporting
   export_raw: "{{ states(export_sensor) | float(0) }}"
   export_w: >
-    {{ export_raw if positive_when_exporting else (-export_raw) }}
+    {{ (export_raw if positive_when_exporting else (-export_raw)) | float(0) }}
 
   # sunset window
   next_setting: "{{ state_attr('sun.sun', 'next_setting') }}"
   minutes_to_sunset: >
     {% if next_setting %}
-      {{ ((as_timestamp(next_setting) - as_timestamp(now())) / 60) | round(0) }}
+      {{ ((as_timestamp(next_setting) - as_timestamp(now())) / 60) | round(0) | int }}
     {% else %}
-      9999
+      {{ 9999 }}
     {% endif %}
-  in_pause_window: "{{ minutes_to_sunset <= lead_minutes and minutes_to_sunset > -5 }}"
+  in_pause_window: >
+    {{ minutes_to_sunset <= lead_minutes
+       and minutes_to_sunset >= (-1 * pause_window_end_offset) }}
 
   paused_by_us: "{{ is_state(paused_flag, 'on') }}"
+
+  # --- pause-time reference (explicit helper preferred, fallback to last_changed) ---
+  pause_ref_ts: >
+    {% if has_pause_ts %}
+      {% set ts = states(pause_timestamp) %}
+      {% if ts in ['unknown','unavailable','none',''] or ts is none %}
+        0
+      {% else %}
+        {{ as_timestamp(ts) | float(0) }}
+      {% endif %}
+    {% else %}
+      {{ as_timestamp(states[paused_flag.split('.')[1]].last_changed
+         if states[paused_flag.split('.')[1]] is defined else now()) | float(0) }}
+    {% endif %}
+  hours_since_pause: >
+    {% if pause_ref_ts and pause_ref_ts > 0 %}
+      {{ ((as_timestamp(now()) - pause_ref_ts) / 3600) | float(0) }}
+    {% else %}
+      {{ 9999 }}
+    {% endif %}
+  minutes_since_low_export: >
+    {% if has_low_export_ts %}
+      {% set ts = states(low_export_since) %}
+      {% if ts in ['unknown','unavailable','none',''] or ts is none %}
+        0
+      {% else %}
+        {{ ((as_timestamp(now()) - as_timestamp(ts)) / 60) | float(0) }}
+      {% endif %}
+    {% else %}
+      {{ 9999 }}
+    {% endif %}
+
+  # --- already-resumed-today guard ---
+  resumed_today: >
+    {% if has_last_resume %}
+      {% set ts = states(last_resume_date) %}
+      {% if ts in ['unknown','unavailable','none',''] or ts is none %}
+        false
+      {% else %}
+        {{ (as_timestamp(ts) | timestamp_custom('%Y-%m-%d', true))
+           == now().strftime('%Y-%m-%d') }}
+      {% endif %}
+    {% else %}
+      false
+    {% endif %}
+
+  # --- "smarter" skip-pause gates ---
+  solar_remaining_kwh: >
+    {% if has_solar_remaining %}{{ states(solar_forecast_remaining_sensor) | float(0) }}{% else %}0{% endif %}
+  cycle_energy_kwh: >
+    {{ ((appliance_power_w | float(0)) * (remaining_minutes | float(0)) / 60.0 / 1000.0) | float(0) }}
+  solar_covers_cycle: >
+    {{ has_solar_remaining and solar_remaining_kwh >= cycle_energy_kwh and cycle_energy_kwh > 0 }}
+
+  tomorrow_kwh: >
+    {% if has_tomorrow_fc %}{{ states(tomorrow_forecast_sensor) | float(0) }}{% else %}9999{% endif %}
+  tomorrow_too_poor: "{{ has_tomorrow_fc and tomorrow_kwh < min_tomorrow_kwh }}"
+
+  tariff_now: >
+    {% if has_tariff %}{{ states(tariff_sensor) | float(99999) }}{% else %}99999{% endif %}
+  grid_is_cheap: "{{ has_tariff and tariff_now < cheap_grid_threshold }}"
+
+  battery_soc_now: >
+    {% if has_battery %}{{ states(battery_soc_sensor) | float(0) }}{% else %}0{% endif %}
+  battery_has_headroom: "{{ has_battery and battery_soc_now >= battery_min_soc }}"
+
+  skip_pause: >
+    {{ solar_covers_cycle or tomorrow_too_poor or grid_is_cheap or battery_has_headroom }}
+
+  # --- pause-dwell satisfied ---
+  pause_dwell_ok: >
+    {{ (pause_dwell | int(0)) == 0
+       or (has_low_export_ts and minutes_since_low_export >= (pause_dwell | int(0))) }}
+
+  # --- resume time-of-day OK ---
+  past_earliest_resume_hour: "{{ now().hour >= (earliest_resume_hour | int(8)) }}"
+  past_min_pause: "{{ hours_since_pause >= (min_pause_hours | float(4)) }}"
 
 condition:
   - condition: state
@@ -364,62 +701,120 @@ condition:
 
 action:
   - choose:
+
+      # ---------- Track low-export timestamp (for pause_dwell) ----------
+      # Set when export drops below threshold and we don't already have a stamp.
+      - conditions:
+          - "{{ has_low_export_ts }}"
+          - "{{ is_running }}"
+          - "{{ export_w < export_threshold }}"
+          - >
+            {% set ts = states(low_export_since) %}
+            {{ ts in ['unknown','unavailable','none',''] or ts is none
+               or (as_timestamp(now()) - as_timestamp(ts)) > 86400 }}
+        sequence:
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: !input low_export_since
+            data:
+              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+      # Clear low-export stamp once export recovers, so dwell restarts cleanly next dip.
+      - conditions:
+          - "{{ has_low_export_ts }}"
+          - "{{ export_w >= export_threshold }}"
+          - >
+            {% set ts = states(low_export_since) %}
+            {{ not (ts in ['unknown','unavailable','none',''] or ts is none) }}
+        sequence:
+          # Push it far in the past — effectively "no current low-export run".
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: !input low_export_since
+            data:
+              datetime: "1970-01-01 00:00:00"
+
       # ---------- PAUSE ----------
       - conditions:
           - "{{ is_running }}"
           - "{{ in_pause_window }}"
           - "{{ export_w < export_threshold }}"
+          - "{{ pause_dwell_ok }}"
           - "{{ remaining_minutes > min_remaining_minutes }}"
+          - "{{ remaining_minutes <= max_remaining_minutes }}"
           - "{{ not paused_by_us }}"
+          - "{{ not skip_pause }}"
         sequence:
-          - service: input_boolean.turn_on
-            target:
-              entity_id: !input paused_flag
+          # Only flip the "we paused this" flag when we actually act on the appliance.
           - choose:
-              - conditions: "{{ pause_mode == 'select_option' and operation_select not in [none, ''] }}"
+              - conditions: "{{ pause_mode != 'notify_only' }}"
+                sequence:
+                  - service: input_boolean.turn_on
+                    target:
+                      entity_id: !input paused_flag
+                  - choose:
+                      - conditions: "{{ has_pause_ts }}"
+                        sequence:
+                          - service: input_datetime.set_datetime
+                            target:
+                              entity_id: !input pause_timestamp
+                            data:
+                              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+          - choose:
+              - conditions: "{{ pause_mode == 'select_option' and has_op_select }}"
                 sequence:
                   - service: select.select_option
                     target:
                       entity_id: "{{ operation_select }}"
                     data:
                       option: "{{ pause_option }}"
-              - conditions: "{{ pause_mode == 'switch_off' and power_switch not in [none, ''] }}"
+              - conditions: "{{ pause_mode == 'switch_off' and has_power_switch }}"
                 sequence:
                   - service: switch.turn_off
                     target:
                       entity_id: "{{ power_switch }}"
           - choose:
-              - conditions: "{{ notify_service not in [none, ''] }}"
+              - conditions: "{{ has_notify }}"
                 sequence:
                   - service: "{{ notify_service }}"
                     data:
                       title: "Solar pause"
                       message: >
-                        Paused {{ appliance_friendly_name }} ({{ remaining_minutes | int }} min left,
-                        export {{ export_w | int }} W, {{ minutes_to_sunset | int }} min to sunset).
-                        Will resume {% if resume_strategy == 'auto_export' %}when solar returns
-                        {% elif resume_strategy == 'fixed_time' %}at {{ states(resume_time) if resume_time else 'configured time' }}
-                        {% else %}when you press resume{% endif %}.
+                        {% if pause_mode == 'notify_only' -%}
+                        Consider pausing {{ appliance_friendly_name }} —
+                        {%- else -%}
+                        Paused {{ appliance_friendly_name }} —
+                        {%- endif %}
+                        {{ remaining_minutes | int }} min left
+                        (~{{ cycle_energy_kwh | round(2) }} kWh),
+                        export {{ export_w | int }} W,
+                        {{ minutes_to_sunset | int }} min to sunset.
+                        Will resume
+                        {%- if resume_strategy == 'auto_export' %} when solar returns
+                        {%- elif resume_strategy == 'fixed_time' %} at
+                          {{ states(resume_time) if has_resume_time else 'configured time' }}
+                        {%- else %} when you press resume{%- endif %}.
 
       # ---------- RESUME (auto_export) ----------
       - conditions:
           - "{{ paused_by_us }}"
           - "{{ is_paused }}"
           - "{{ resume_strategy == 'auto_export' }}"
+          - "{{ past_earliest_resume_hour }}"
+          - "{{ past_min_pause }}"
+          - "{{ not resumed_today }}"
           - "{{ export_w >= export_threshold }}"
-          - >
-            {{ (as_timestamp(now()) - as_timestamp(states.input_boolean[paused_flag.split('.')[1]].last_changed))
-               / 60 >= resume_dwell }}
+          - "{{ hours_since_pause * 60 >= resume_dwell }}"
         sequence:
           - choose:
-              - conditions: "{{ pause_mode == 'select_option' and operation_select not in [none, ''] }}"
+              - conditions: "{{ pause_mode == 'select_option' and has_op_select }}"
                 sequence:
                   - service: select.select_option
                     target:
                       entity_id: "{{ operation_select }}"
                     data:
                       option: "{{ resume_option }}"
-              - conditions: "{{ pause_mode == 'switch_off' and power_switch not in [none, ''] }}"
+              - conditions: "{{ pause_mode == 'switch_off' and has_power_switch }}"
                 sequence:
                   - service: switch.turn_on
                     target:
@@ -428,7 +823,15 @@ action:
             target:
               entity_id: !input paused_flag
           - choose:
-              - conditions: "{{ notify_service not in [none, ''] }}"
+              - conditions: "{{ has_last_resume }}"
+                sequence:
+                  - service: input_datetime.set_datetime
+                    target:
+                      entity_id: !input last_resume_date
+                    data:
+                      datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+          - choose:
+              - conditions: "{{ has_notify }}"
                 sequence:
                   - service: "{{ notify_service }}"
                     data:
@@ -441,29 +844,27 @@ action:
           - "{{ paused_by_us }}"
           - "{{ is_paused }}"
           - "{{ resume_strategy == 'fixed_time' }}"
-          - "{{ resume_time not in [none, ''] }}"
+          - "{{ has_resume_time }}"
+          - "{{ past_earliest_resume_hour }}"
+          - "{{ past_min_pause }}"
+          - "{{ not resumed_today }}"
           - >
             {% set rt = states(resume_time) %}
             {% if rt in ['unknown','unavailable','none',''] or rt is none %}
               false
             {% else %}
-              {% set parts = rt.split(':') | map('int') | list %}
-              {% set target_today = today_at(rt) %}
-              {{ now() >= target_today }}
+              {{ now() >= today_at(rt) }}
             {% endif %}
-          - >
-            {{ (as_timestamp(now()) - as_timestamp(states.input_boolean[paused_flag.split('.')[1]].last_changed))
-               / 3600 >= 4 }}
         sequence:
           - choose:
-              - conditions: "{{ pause_mode == 'select_option' and operation_select not in [none, ''] }}"
+              - conditions: "{{ pause_mode == 'select_option' and has_op_select }}"
                 sequence:
                   - service: select.select_option
                     target:
                       entity_id: "{{ operation_select }}"
                     data:
                       option: "{{ resume_option }}"
-              - conditions: "{{ pause_mode == 'switch_off' and power_switch not in [none, ''] }}"
+              - conditions: "{{ pause_mode == 'switch_off' and has_power_switch }}"
                 sequence:
                   - service: switch.turn_on
                     target:
@@ -472,7 +873,15 @@ action:
             target:
               entity_id: !input paused_flag
           - choose:
-              - conditions: "{{ notify_service not in [none, ''] }}"
+              - conditions: "{{ has_last_resume }}"
+                sequence:
+                  - service: input_datetime.set_datetime
+                    target:
+                      entity_id: !input last_resume_date
+                    data:
+                      datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+          - choose:
+              - conditions: "{{ has_notify }}"
                 sequence:
                   - service: "{{ notify_service }}"
                     data:
