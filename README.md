@@ -19,9 +19,11 @@ runs on grid power after dark. This blueprint watches for that and, if
 your solar is already fading, hits "pause" before sunset and resumes
 the cycle the next morning when the sun is back.
 
-### The basic idea, every minute
+### The basic idea
 
-A timer ticks once a minute. On each tick it asks:
+The automation re-evaluates whenever something interesting happens —
+the appliance's state changes, grid export swings, the sun sets, or a
+5-minute safety-net tick fires. On each evaluation it asks:
 
 1. **Is the appliance actually running?** (looks at the status sensor)
 2. **Are we close to sunset?** (within `lead_minutes`, default 60)

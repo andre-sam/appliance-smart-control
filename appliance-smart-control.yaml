@@ -506,12 +506,25 @@ mode: single
 max_exceeded: silent
 
 trigger:
+  # Periodic safety net — handles time-of-day crossings (sunset proximity,
+  # fixed_time resume) and dwell timers without needing per-helper logic.
+  # 5 min is plenty: sunset shifts <1 min/day and pause timing is coarse.
   - platform: time_pattern
-    minutes: "/1"
+    minutes: "/5"
     id: tick
+  # React immediately when the appliance starts/stops/pauses.
   - platform: state
     entity_id: !input status_sensor
     id: status_change
+  # React immediately when grid export changes meaningfully — no need to
+  # wait up to 5 min for the next tick to notice a big swing.
+  - platform: state
+    entity_id: !input export_sensor
+    id: export_change
+  # Guarantee an evaluation right at sunset, independent of tick alignment.
+  - platform: sun
+    event: sunset
+    id: sunset
 
 variables:
   enable_toggle: !input enable_toggle
