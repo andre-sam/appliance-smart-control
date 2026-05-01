@@ -1,0 +1,490 @@
+blueprint:
+  name: Appliance Smart Control (LG ThinQ)
+  description: >
+    Pauses a long-running appliance (dishwasher, washing machine, tumble
+    dryer, ...) shortly before sunset when household solar export drops
+    below a threshold, so the remaining cycle runs the next day on free
+    solar instead of grid power.
+
+
+    Designed around LG ThinQ entities (`sensor.*_current_status`,
+    `select.*_operation`, `switch.*_power`, `sensor.*_remaining_time`)
+    but works with anything that exposes equivalent entities.
+
+
+    Logic (evaluated every minute):
+      • If the appliance is running AND now is within `lead_minutes`
+        of sunset AND grid export < `export_threshold` AND remaining
+        cycle time > `min_remaining_minutes`, pause it and remember
+        that WE paused it.
+      • The next day, optionally auto-resume:
+          - `auto_export`  : when export ≥ threshold again
+          - `fixed_time`   : at a configured time
+          - `manual`       : only notify, you press resume yourself
+      • Pause action is configurable per appliance:
+          - `select_option`: call select.select_option on
+            `select.*_operation` with the configured value (LG dryer/washer)
+          - `switch_off`   : turn off a power switch (DRYER ONLY — do NOT
+            cut power to washers/dishwashers mid-cycle)
+          - `notify_only`  : send a notification, do nothing else
+            (use for the LG dishwasher which is read-only in HA)
+
+
+    Instantiate once per appliance.
+
+
+    Required helpers (create per appliance):
+      • input_boolean.<appliance>_paused_by_solar
+        — flag the blueprint sets when IT paused the appliance, so it
+        only resumes things it paused itself.
+
+  domain: automation
+  source_url: https://github.com/andre-sam/appliance-smart-control/blob/main/appliance-smart-control.yaml
+
+  input:
+    enable_toggle:
+      name: Master enable toggle
+      description: input_boolean to enable/disable this automation.
+      selector:
+        entity:
+          domain: input_boolean
+
+    # ---------- Appliance state ----------
+    status_sensor:
+      name: Appliance status sensor
+      description: >
+        Sensor reporting the appliance's current operating state, e.g.
+        `sensor.dishwasher_current_status`. Expected states like
+        `running`, `pause`, `power_off`, `end`, `delayed_start`.
+      selector:
+        entity:
+          domain: sensor
+
+    running_states:
+      name: "Status values that mean RUNNING"
+      description: >
+        Comma-separated list of `status_sensor` states that should be
+        treated as "currently running" (and therefore eligible to pause).
+        LG ThinQ default covers dishwasher / washer / dryer cycle phases.
+      default: "running,detecting,rinsing,spinning,drying,cooling,cool_down,wrinkle_care,refreshing,night_dry,rinse_hold"
+      selector:
+        text:
+
+    paused_states:
+      name: "Status values that mean PAUSED"
+      description: >
+        Comma-separated list of `status_sensor` states that should be
+        treated as "currently paused" (eligible to auto-resume).
+      default: "pause,paused"
+      selector:
+        text:
+
+    remaining_time_sensor:
+      name: Remaining cycle time sensor
+      description: >
+        Sensor reporting time left in the current cycle, e.g.
+        `sensor.dishwasher_remaining_time`. Used to skip the pause if
+        the cycle is almost finished. Accepts states formatted as
+        minutes (number) or `HH:MM:SS` / `HH:MM`.
+      selector:
+        entity:
+          domain: sensor
+
+    min_remaining_minutes:
+      name: Minimum remaining minutes to bother pausing
+      description: >
+        If less than this many minutes are left in the cycle, just let
+        it finish on grid power instead of pausing.
+      default: 15
+      selector:
+        number:
+          min: 0
+          max: 240
+          unit_of_measurement: min
+          mode: box
+
+    # ---------- Pause action ----------
+    pause_mode:
+      name: How to pause this appliance
+      description: >
+        - `select_option`: calls `select.select_option` on the configured
+          operation select (LG dryer & washer).
+        - `switch_off`: turns off a power switch — DRYER ONLY.
+        - `notify_only`: sends a notification, takes no action (LG
+          dishwasher which has no controllable entities in HA).
+      default: notify_only
+      selector:
+        select:
+          options:
+            - select_option
+            - switch_off
+            - notify_only
+
+    operation_select:
+      name: "Operation select entity (for `select_option` mode)"
+      description: >
+        e.g. `select.dryer_operation` / `select.washer_operation`.
+        Ignored unless `pause_mode` is `select_option`.
+      default:
+      selector:
+        entity:
+          domain: select
+
+    pause_option:
+      name: "Option to send to pause (for `select_option` mode)"
+      description: >
+        Value passed to `select.select_option`. For LG ThinQ washer/dryer
+        the available options are `start`, `stop`, `power_off`, `wake_up` —
+        use `stop` to pause (`power_off` would END the cycle).
+      default: "stop"
+      selector:
+        text:
+
+    resume_option:
+      name: "Option to send to resume (for `select_option` mode)"
+      description: >
+        Value passed to `select.select_option` when auto-resuming.
+        For LG ThinQ washer/dryer this is `start` (or `wake_up` if the
+        unit has gone to sleep).
+      default: "start"
+      selector:
+        text:
+
+    power_switch:
+      name: "Power switch (for `switch_off` mode — DRYER ONLY)"
+      description: >
+        e.g. `switch.dryer_power`. Ignored unless `pause_mode` is
+        `switch_off`. Do NOT use this for washers or dishwashers.
+      default:
+      selector:
+        entity:
+          domain: switch
+
+    paused_flag:
+      name: "Paused-by-solar flag (input_boolean)"
+      description: >
+        Per-appliance input_boolean the blueprint flips ON when it
+        pauses the appliance, and OFF after a successful resume. Lets
+        the blueprint distinguish "I paused this" from "the user
+        paused this manually".
+      selector:
+        entity:
+          domain: input_boolean
+
+    # ---------- Solar / sunset ----------
+    export_sensor:
+      name: Grid export power sensor
+      description: >
+        Power flowing to the grid. Either signed (negative when
+        exporting) or positive-when-exporting — toggle below.
+      selector:
+        entity:
+          domain: sensor
+          device_class: power
+
+    positive_when_exporting:
+      name: Export sensor is positive when exporting
+      description: >
+        ON: sensor reads positive watts while exporting (e.g.
+        a dedicated export sensor). OFF: sensor is signed and reads
+        negative when exporting (typical net grid sensor).
+      default: false
+      selector:
+        boolean:
+
+    export_threshold:
+      name: Export threshold (W)
+      description: >
+        If grid export is BELOW this value as sunset approaches, the
+        appliance gets paused.
+      default: 300
+      selector:
+        number:
+          min: 0
+          max: 5000
+          step: 50
+          unit_of_measurement: W
+          mode: box
+
+    lead_minutes:
+      name: Pause lead time before sunset (minutes)
+      description: >
+        How many minutes before sunset the pause window opens.
+      default: 60
+      selector:
+        number:
+          min: 0
+          max: 240
+          unit_of_measurement: min
+          mode: box
+
+    # ---------- Resume ----------
+    resume_strategy:
+      name: Resume strategy
+      description: >
+        - `auto_export`: auto-resume the next day once grid export is
+          back above the threshold for `resume_dwell` minutes.
+        - `fixed_time`: auto-resume at `resume_time` the next day.
+        - `manual`: only notify; you press resume yourself.
+      default: manual
+      selector:
+        select:
+          options:
+            - auto_export
+            - fixed_time
+            - manual
+
+    resume_dwell:
+      name: "Resume dwell (minutes, for `auto_export` mode)"
+      description: >
+        Export must stay above the threshold this long before resuming,
+        to avoid flapping on a passing cloud.
+      default: 10
+      selector:
+        number:
+          min: 0
+          max: 120
+          unit_of_measurement: min
+          mode: box
+
+    resume_time:
+      name: "Earliest resume time (input_datetime, for `fixed_time` mode)"
+      description: >
+        Time-of-day input_datetime; the appliance is resumed at or after
+        this time on the day after it was paused.
+      default:
+      selector:
+        entity:
+          domain: input_datetime
+
+    # ---------- Notification ----------
+    notify_service:
+      name: Notification service (optional)
+      description: >
+        e.g. `notify.mobile_app_pixel`. Leave blank to disable
+        notifications. Required if `pause_mode` is `notify_only`.
+      default: ""
+      selector:
+        text:
+
+    appliance_friendly_name:
+      name: Appliance friendly name
+      description: Used in notification text, e.g. "Dishwasher".
+      default: "Appliance"
+      selector:
+        text:
+
+mode: single
+max_exceeded: silent
+
+trigger:
+  - platform: time_pattern
+    minutes: "/1"
+    id: tick
+  - platform: state
+    entity_id: !input status_sensor
+    id: status_change
+
+variables:
+  enable_toggle: !input enable_toggle
+  status_sensor: !input status_sensor
+  running_states: !input running_states
+  paused_states: !input paused_states
+  remaining_time_sensor: !input remaining_time_sensor
+  min_remaining_minutes: !input min_remaining_minutes
+
+  pause_mode: !input pause_mode
+  operation_select: !input operation_select
+  pause_option: !input pause_option
+  resume_option: !input resume_option
+  power_switch: !input power_switch
+  paused_flag: !input paused_flag
+
+  export_sensor: !input export_sensor
+  positive_when_exporting: !input positive_when_exporting
+  export_threshold: !input export_threshold
+  lead_minutes: !input lead_minutes
+
+  resume_strategy: !input resume_strategy
+  resume_dwell: !input resume_dwell
+  resume_time: !input resume_time
+
+  notify_service: !input notify_service
+  appliance_friendly_name: !input appliance_friendly_name
+
+  # --- derived ---
+  status_raw: "{{ states(status_sensor) | lower }}"
+  running_list: >
+    {{ running_states.split(',') | map('trim') | map('lower') | list }}
+  paused_list: >
+    {{ paused_states.split(',') | map('trim') | map('lower') | list }}
+  is_running: "{{ status_raw in running_list }}"
+  is_paused: "{{ status_raw in paused_list }}"
+
+  # remaining minutes — accepts numeric minutes or HH:MM[:SS]
+  remaining_raw: "{{ states(remaining_time_sensor) }}"
+  remaining_minutes: >
+    {% set v = remaining_raw %}
+    {% if v in ['unknown','unavailable','none',''] or v is none %}
+      0
+    {% elif ':' in v %}
+      {% set parts = v.split(':') | map('int') | list %}
+      {% if parts|length == 3 %}
+        {{ parts[0]*60 + parts[1] + (parts[2]/60) | round(0) }}
+      {% elif parts|length == 2 %}
+        {{ parts[0]*60 + parts[1] }}
+      {% else %}
+        0
+      {% endif %}
+    {% else %}
+      {{ v | float(0) | round(0) }}
+    {% endif %}
+
+  # export power normalised so positive = exporting
+  export_raw: "{{ states(export_sensor) | float(0) }}"
+  export_w: >
+    {{ export_raw if positive_when_exporting else (-export_raw) }}
+
+  # sunset window
+  next_setting: "{{ state_attr('sun.sun', 'next_setting') }}"
+  minutes_to_sunset: >
+    {% if next_setting %}
+      {{ ((as_timestamp(next_setting) - as_timestamp(now())) / 60) | round(0) }}
+    {% else %}
+      9999
+    {% endif %}
+  in_pause_window: "{{ minutes_to_sunset <= lead_minutes and minutes_to_sunset > -5 }}"
+
+  paused_by_us: "{{ is_state(paused_flag, 'on') }}"
+
+condition:
+  - condition: state
+    entity_id: !input enable_toggle
+    state: "on"
+
+action:
+  - choose:
+      # ---------- PAUSE ----------
+      - conditions:
+          - "{{ is_running }}"
+          - "{{ in_pause_window }}"
+          - "{{ export_w < export_threshold }}"
+          - "{{ remaining_minutes > min_remaining_minutes }}"
+          - "{{ not paused_by_us }}"
+        sequence:
+          - service: input_boolean.turn_on
+            target:
+              entity_id: !input paused_flag
+          - choose:
+              - conditions: "{{ pause_mode == 'select_option' and operation_select not in [none, ''] }}"
+                sequence:
+                  - service: select.select_option
+                    target:
+                      entity_id: "{{ operation_select }}"
+                    data:
+                      option: "{{ pause_option }}"
+              - conditions: "{{ pause_mode == 'switch_off' and power_switch not in [none, ''] }}"
+                sequence:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: "{{ power_switch }}"
+          - choose:
+              - conditions: "{{ notify_service not in [none, ''] }}"
+                sequence:
+                  - service: "{{ notify_service }}"
+                    data:
+                      title: "Solar pause"
+                      message: >
+                        Paused {{ appliance_friendly_name }} ({{ remaining_minutes | int }} min left,
+                        export {{ export_w | int }} W, {{ minutes_to_sunset | int }} min to sunset).
+                        Will resume {% if resume_strategy == 'auto_export' %}when solar returns
+                        {% elif resume_strategy == 'fixed_time' %}at {{ states(resume_time) if resume_time else 'configured time' }}
+                        {% else %}when you press resume{% endif %}.
+
+      # ---------- RESUME (auto_export) ----------
+      - conditions:
+          - "{{ paused_by_us }}"
+          - "{{ is_paused }}"
+          - "{{ resume_strategy == 'auto_export' }}"
+          - "{{ export_w >= export_threshold }}"
+          - >
+            {{ (as_timestamp(now()) - as_timestamp(states.input_boolean[paused_flag.split('.')[1]].last_changed))
+               / 60 >= resume_dwell }}
+        sequence:
+          - choose:
+              - conditions: "{{ pause_mode == 'select_option' and operation_select not in [none, ''] }}"
+                sequence:
+                  - service: select.select_option
+                    target:
+                      entity_id: "{{ operation_select }}"
+                    data:
+                      option: "{{ resume_option }}"
+              - conditions: "{{ pause_mode == 'switch_off' and power_switch not in [none, ''] }}"
+                sequence:
+                  - service: switch.turn_on
+                    target:
+                      entity_id: "{{ power_switch }}"
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !input paused_flag
+          - choose:
+              - conditions: "{{ notify_service not in [none, ''] }}"
+                sequence:
+                  - service: "{{ notify_service }}"
+                    data:
+                      title: "Solar resume"
+                      message: >
+                        Resumed {{ appliance_friendly_name }} (export {{ export_w | int }} W).
+
+      # ---------- RESUME (fixed_time) ----------
+      - conditions:
+          - "{{ paused_by_us }}"
+          - "{{ is_paused }}"
+          - "{{ resume_strategy == 'fixed_time' }}"
+          - "{{ resume_time not in [none, ''] }}"
+          - >
+            {% set rt = states(resume_time) %}
+            {% if rt in ['unknown','unavailable','none',''] or rt is none %}
+              false
+            {% else %}
+              {% set parts = rt.split(':') | map('int') | list %}
+              {% set target_today = today_at(rt) %}
+              {{ now() >= target_today }}
+            {% endif %}
+          - >
+            {{ (as_timestamp(now()) - as_timestamp(states.input_boolean[paused_flag.split('.')[1]].last_changed))
+               / 3600 >= 4 }}
+        sequence:
+          - choose:
+              - conditions: "{{ pause_mode == 'select_option' and operation_select not in [none, ''] }}"
+                sequence:
+                  - service: select.select_option
+                    target:
+                      entity_id: "{{ operation_select }}"
+                    data:
+                      option: "{{ resume_option }}"
+              - conditions: "{{ pause_mode == 'switch_off' and power_switch not in [none, ''] }}"
+                sequence:
+                  - service: switch.turn_on
+                    target:
+                      entity_id: "{{ power_switch }}"
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !input paused_flag
+          - choose:
+              - conditions: "{{ notify_service not in [none, ''] }}"
+                sequence:
+                  - service: "{{ notify_service }}"
+                    data:
+                      title: "Solar resume"
+                      message: "Resumed {{ appliance_friendly_name }} on schedule."
+
+      # ---------- CLEAR FLAG if user manually resumed / cycle ended ----------
+      - conditions:
+          - "{{ paused_by_us }}"
+          - "{{ not is_paused }}"
+          - "{{ not is_running }}"
+        sequence:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !input paused_flag
