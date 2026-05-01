@@ -485,6 +485,71 @@ blueprint:
         entity:
           domain: input_datetime
 
+    # ---------- Keepalive (LG auto-power-off workaround) ----------
+    keepalive_enabled:
+      name: "Keepalive: defer the appliance's auto-power-off"
+      description: >
+        LG ThinQ washers/dryers typically auto-power-off after ~4 hours
+        in pause, which would lose the cycle before tomorrow's solar
+        arrives. When enabled, this periodically sends a benign
+        "wake" command to the operation select to reset the timeout
+        countdown. ONLY use with `pause_mode: select_option`. Has no
+        effect for `notify_only` or `switch_off`.
+      default: false
+      selector:
+        boolean:
+
+    keepalive_option:
+      name: "Keepalive option (sent to operation select)"
+      description: >
+        Value sent to `select.select_option` to defer auto-power-off.
+        For LG ThinQ this should be `wake_up` — it lights the display
+        without affecting the paused program. NEVER set this to
+        `start` (would resume the cycle immediately) or `power_off`
+        (would end it).
+      default: "wake_up"
+      selector:
+        text:
+
+    keepalive_interval_hours:
+      name: Keepalive interval (hours)
+      description: >
+        How often to send the keepalive command while paused. Must be
+        SHORTER than your appliance's auto-power-off timeout
+        (LG ThinQ ~4 h). Default 3 h leaves ~1 h safety margin.
+      default: 3
+      selector:
+        number:
+          min: 1
+          max: 6
+          step: 0.5
+          unit_of_measurement: h
+          mode: box
+
+    last_keepalive:
+      name: "Last-keepalive timestamp (input_datetime, optional)"
+      description: >
+        Optional input_datetime (date AND time) where the blueprint
+        records when it last sent a keepalive. REQUIRED if
+        `keepalive_enabled` is true — without it the blueprint can't
+        space the taps out and would spam them every tick.
+      default: ""
+      selector:
+        entity:
+          domain: input_datetime
+
+    timeout_states:
+      name: "Status values that mean APPLIANCE TIMED OUT / CYCLE LOST"
+      description: >
+        Comma-separated `status_sensor` states that indicate the
+        appliance powered itself off or otherwise dropped the
+        program while we had it paused. If one of these is seen
+        while `paused_by_solar` is on, the user is notified that the
+        cycle was lost and the flag is cleared.
+      default: "power_off,off,end,initial"
+      selector:
+        text:
+
     # ---------- Notification ----------
     notify_service:
       name: Notification service (optional)
@@ -567,6 +632,12 @@ variables:
   min_pause_hours: !input min_pause_hours
   last_resume_date: !input last_resume_date
 
+  keepalive_enabled: !input keepalive_enabled
+  keepalive_option: !input keepalive_option
+  keepalive_interval_hours: !input keepalive_interval_hours
+  last_keepalive: !input last_keepalive
+  timeout_states: !input timeout_states
+
   notify_service: !input notify_service
   appliance_friendly_name: !input appliance_friendly_name
 
@@ -582,6 +653,7 @@ variables:
   has_tariff:          "{{ (tariff_sensor          | string | length) > 0 }}"
   has_battery:         "{{ (battery_soc_sensor     | string | length) > 0 }}"
   has_notify:          "{{ (notify_service         | string | length) > 0 }}"
+  has_last_keepalive:  "{{ (last_keepalive         | string | length) > 0 }}"
 
   # --- derived: status ---
   status_raw: "{{ states(status_sensor) | lower }}"
@@ -589,8 +661,11 @@ variables:
     {{ running_states.split(',') | map('trim') | map('lower') | list }}
   paused_list: >
     {{ paused_states.split(',') | map('trim') | map('lower') | list }}
+  timeout_list: >
+    {{ timeout_states.split(',') | map('trim') | map('lower') | list }}
   is_running: "{{ status_raw in running_list }}"
   is_paused: "{{ status_raw in paused_list }}"
+  is_timed_out: "{{ status_raw in timeout_list }}"
 
   # remaining minutes — accepts numeric minutes or HH:MM[:SS]
   remaining_raw: "{{ states(remaining_time_sensor) }}"
@@ -660,6 +735,26 @@ variables:
     {% else %}
       {{ 9999 }}
     {% endif %}
+
+  # --- keepalive timing ---
+  hours_since_keepalive: >
+    {% if has_last_keepalive %}
+      {% set ts = states(last_keepalive) %}
+      {% if ts in ['unknown','unavailable','none',''] or ts is none %}
+        9999
+      {% else %}
+        {{ ((as_timestamp(now()) - as_timestamp(ts)) / 3600) | float(0) }}
+      {% endif %}
+    {% else %}
+      {{ 9999 }}
+    {% endif %}
+  keepalive_due: >
+    {{ keepalive_enabled
+       and pause_mode == 'select_option'
+       and has_op_select
+       and has_last_keepalive
+       and hours_since_keepalive >= (keepalive_interval_hours | float(3))
+       and now().hour < (earliest_resume_hour | int(8)) }}
 
   # --- already-resumed-today guard ---
   resumed_today: >
@@ -771,6 +866,17 @@ action:
                           - service: input_datetime.set_datetime
                             target:
                               entity_id: !input pause_timestamp
+                            data:
+                              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+                  # Seed last_keepalive at pause time so the first
+                  # keepalive fires `keepalive_interval_hours` later, not
+                  # on the very next tick.
+                  - choose:
+                      - conditions: "{{ keepalive_enabled and has_last_keepalive }}"
+                        sequence:
+                          - service: input_datetime.set_datetime
+                            target:
+                              entity_id: !input last_keepalive
                             data:
                               datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
           - choose:
@@ -900,6 +1006,50 @@ action:
                     data:
                       title: "Solar resume"
                       message: "Resumed {{ appliance_friendly_name }} on schedule."
+
+      # ---------- KEEPALIVE (defer LG auto-power-off) ----------
+      # Send `wake_up` (configurable) to the operation select periodically
+      # while the appliance is paused-by-us, to reset its idle timeout.
+      # Strict guardrails: only with select_option mode, only while still
+      # in a paused state, only before earliest_resume_hour, and only when
+      # the configured interval has elapsed since the previous keepalive.
+      - conditions:
+          - "{{ paused_by_us }}"
+          - "{{ is_paused }}"
+          - "{{ keepalive_due }}"
+        sequence:
+          - service: select.select_option
+            target:
+              entity_id: "{{ operation_select }}"
+            data:
+              option: "{{ keepalive_option }}"
+          - service: input_datetime.set_datetime
+            target:
+              entity_id: !input last_keepalive
+            data:
+              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+      # ---------- TIMEOUT DETECTED (cycle lost) ----------
+      # We paused it, but status is now in `timeout_states` — appliance
+      # auto-powered-off and the program is gone. Notify the user so
+      # they can restart it manually, and clear our flag.
+      - conditions:
+          - "{{ paused_by_us }}"
+          - "{{ is_timed_out }}"
+        sequence:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !input paused_flag
+          - choose:
+              - conditions: "{{ has_notify }}"
+                sequence:
+                  - service: "{{ notify_service }}"
+                    data:
+                      title: "Solar pause: cycle lost"
+                      message: >
+                        {{ appliance_friendly_name }} powered off while
+                        paused (status: {{ status_raw }}). The cycle was
+                        not auto-resumed — please restart it manually.
 
       # ---------- CLEAR FLAG if user manually resumed / cycle ended ----------
       - conditions:

@@ -136,6 +136,12 @@ left blank and the blueprint will fall back to less precise behaviour.
   remembers when an auto-resume last fired, so it can't fire twice
   on the same day.
 
+### Required if using keepalive (per appliance)
+
+- `input_datetime.<appliance>_last_keepalive` (date + time) —
+  records the last time a keepalive command was sent. Without it the
+  blueprint can't space taps out, so keepalive is auto-disabled.
+
 ### Optional (only for `fixed_time` resume)
 
 - `input_datetime.<appliance>_solar_resume_time` (time only).
@@ -154,6 +160,59 @@ pausing when pausing wouldn't actually save anything.
 | `tariff_sensor`                    | Current grid import price. If below `cheap_grid_threshold`, skip pause. |
 | `battery_soc_sensor`               | Home battery SOC %. If at or above `battery_min_soc`, skip pause. *(Future-proof — set later when you add a battery.)* |
 | `appliance_power_w`                | Nominal draw in watts. Used to estimate cycle kWh in notifications and forecast comparison. |
+
+---
+
+## Keepalive (defeating LG's auto-power-off)
+
+LG ThinQ washers and dryers typically auto-power-off **after about
+4 hours in pause**, which destroys the cycle long before tomorrow's
+solar arrives. Keepalive solves this by periodically tapping the
+operation select with a benign command (`wake_up`) to reset the
+appliance's idle countdown.
+
+### How to enable
+
+1. Set `keepalive_enabled: true`.
+2. Provide an `input_datetime` for `last_keepalive` (date + time).
+3. Leave `keepalive_option: wake_up` unless you've verified another
+   value is safer for your firmware.
+4. Tune `keepalive_interval_hours` — default 3 h, must be **shorter**
+   than your appliance's auto-power-off timeout. LG ThinQ ≈ 4 h, so
+   3 h leaves a 1 h safety margin.
+
+### Guardrails (built in)
+
+- **Only fires with `pause_mode: select_option`** — has no effect for
+  `notify_only` or `switch_off`.
+- **Only fires while the status sensor is in a paused state.** If the
+  appliance has already powered off, keepalive does nothing.
+- **Only fires before `earliest_resume_hour`.** Once the resume window
+  opens, the resume branches take over.
+- **Never sends `start` or `power_off`.** The configurable option
+  defaults to `wake_up`; setting it to `start` would resume the
+  cycle immediately and is a misconfiguration.
+- **First keepalive is delayed** by `keepalive_interval_hours` from
+  the moment of pause (the pause itself seeds `last_keepalive`).
+
+### Failure detection
+
+If keepalive doesn't reset your firmware's countdown (or you didn't
+configure it), the appliance will eventually power itself off. The
+blueprint detects this via the `timeout_states` input (default
+`power_off,off,end,initial`):
+
+- If `paused_by_solar` is on AND status enters one of those states,
+  it sends a **"cycle lost"** notification and clears the flag.
+- You'll know to manually restart the appliance — no silent failure.
+
+### Should I enable it?
+
+- **Washer / dryer with `select_option`:** yes, especially in winter
+  when sunset → sunrise is 14+ hours.
+- **Dishwasher (`notify_only`):** no — there's nothing to keep alive,
+  and HA can't control the dishwasher anyway.
+- **Anything on `switch_off`:** no — power is already off.
 
 ---
 
@@ -210,6 +269,10 @@ automation per appliance.
 - Last resume: `input_datetime.washer_last_resume`
 - Resume strategy: `auto_export`
 - Appliance power: `2000` W
+- Keepalive enabled: `true`
+- Keepalive option: `wake_up`
+- Keepalive interval: `3` h
+- Last keepalive: `input_datetime.washer_last_keepalive`
 
 ## Example: dishwasher instance
 
@@ -239,3 +302,13 @@ appliance leaves the running/paused state, no flag needs clearing
   happen — the paused-by-solar flag gates this. If it does, you may
   have flipped the boolean by hand; turn it off and the next manual
   pause will be respected.
+- **"I got a 'cycle lost' notification."** The appliance's internal
+  timeout fired before keepalive could refresh it (or keepalive isn't
+  enabled). Lower `keepalive_interval_hours` (e.g. from 3 to 2) and
+  verify your firmware actually responds to `wake_up`. If `wake_up`
+  doesn't reset the countdown on your unit, there's no software fix —
+  the appliance hardware enforces the timeout.
+- **"Keepalive seems to do nothing."** Check `keepalive_enabled` is
+  on, `pause_mode` is `select_option`, and `last_keepalive` helper is
+  configured (without it keepalive is silently disabled to avoid
+  spamming the appliance).
