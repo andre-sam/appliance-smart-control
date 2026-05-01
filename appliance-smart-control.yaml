@@ -185,6 +185,43 @@ blueprint:
       selector:
         text:
 
+    sleep_state:
+      name: "Status value that means SLEEP / display dormant (optional)"
+      description: >
+        LG dryers move to this status ~10 min after pausing. The API
+        won't accept `start` directly from this state — the blueprint
+        will first send `wake_option` (e.g. `wake_up`, exposed in the
+        UI as "Sleep Mode off"), wait `wake_delay_seconds`, then send
+        the resume option. Leave blank if your appliance doesn't have
+        a sleep state.
+      default: ""
+      selector:
+        text:
+
+    wake_option:
+      name: "Option to send to wake from sleep"
+      description: >
+        Value passed to `select.select_option` to wake the appliance
+        from sleep before resuming. For LG ThinQ this is `wake_up`
+        (shown in the UI as "Sleep Mode off"). Only used when current
+        status equals `sleep_state`.
+      default: "wake_up"
+      selector:
+        text:
+
+    wake_delay_seconds:
+      name: "Wake-up settle delay (seconds)"
+      description: >
+        Time to wait between sending the wake option and sending the
+        resume option, so the appliance has time to leave sleep state.
+      default: 5
+      selector:
+        number:
+          min: 1
+          max: 60
+          unit_of_measurement: s
+          mode: box
+
     power_switch:
       name: "Power switch (for `switch_off` mode)"
       description: >
@@ -278,6 +315,9 @@ variables:
   operation_select: !input operation_select
   pause_option: !input pause_option
   resume_option: !input resume_option
+  sleep_state: !input sleep_state
+  wake_option: !input wake_option
+  wake_delay_seconds: !input wake_delay_seconds
   power_switch: !input power_switch
   paused_flag: !input paused_flag
   remote_start_sensor: !input remote_start_sensor
@@ -296,8 +336,13 @@ variables:
   status_raw: "{{ states(status_sensor) | lower }}"
   running_list: "{{ running_states.split(',') | map('trim') | map('lower') | list }}"
   paused_list:  "{{ paused_states.split(',')  | map('trim') | map('lower') | list }}"
+  sleep_state_lc: "{{ (sleep_state | string | lower) }}"
+  has_sleep_state: "{{ sleep_state_lc | length > 0 }}"
   is_running: "{{ status_raw in running_list }}"
-  is_paused:  "{{ status_raw in paused_list }}"
+  is_sleeping: "{{ has_sleep_state and status_raw == sleep_state_lc }}"
+  # `is_paused` covers both the explicit pause states AND the sleep state
+  # if one is configured — so the resume branch fires from sleep too.
+  is_paused:  "{{ (status_raw in paused_list) or is_sleeping }}"
 
   # --- remaining minutes (only used if a remaining sensor is configured) ---
   remaining_raw: "{{ states(remaining_time_sensor) if has_remaining else '0' }}"
@@ -393,6 +438,19 @@ action:
           - choose:
               - conditions: "{{ pause_mode == 'select_option' and has_op_select }}"
                 sequence:
+                  # If the appliance is in sleep state, wake it first
+                  # (LG dryer: send `wake_up` = "Sleep Mode off"),
+                  # wait for it to settle, then send the resume option.
+                  - choose:
+                      - conditions: "{{ is_sleeping }}"
+                        sequence:
+                          - service: select.select_option
+                            target:
+                              entity_id: "{{ operation_select }}"
+                            data:
+                              option: "{{ wake_option }}"
+                          - delay:
+                              seconds: "{{ wake_delay_seconds | int(5) }}"
                   - service: select.select_option
                     target:
                       entity_id: "{{ operation_select }}"

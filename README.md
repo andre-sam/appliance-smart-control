@@ -64,12 +64,21 @@ reject them anyway.
 > auto-resume after a power cycle. Prefer `select_option` whenever
 > available.
 
-> ⚠️ **LG dryer sleep mode**: about 10 min after pausing, the dryer's
-> status changes to `sleep` and the API rejects further commands. This
-> simple blueprint won't recover it. If a pause is likely to last more
-> than ~10 min, expect that the dryer needs a manual tap on the panel
-> to resume. (A keepalive workaround is possible but not in this
-> simplified version — re-introduce later if needed.)
+> ⚠️ **LG dryer sleep mode** (handled): about 10 min after pausing,
+> the dryer's status changes to `sleep` and the API rejects `start`
+> directly. The blueprint handles this by first sending the
+> `wake_option` (defaults to `wake_up`, shown in the LG UI as
+> "Sleep Mode off"), waiting `wake_delay_seconds`, then sending the
+> normal resume option. To enable this for the dryer, set:
+>
+> - `paused_states`: `pause,sleep`
+> - `sleep_state`: `sleep`
+> - `wake_option`: `wake_up`
+> - `wake_delay_seconds`: `5` (default is fine)
+>
+> If the dryer eventually transitions further to `power_off` (full
+> power-down), the cycle is lost and no software recovery is possible
+> — you'll need to restart it manually.
 
 ---
 
@@ -147,6 +156,9 @@ automation per appliance.
 - As washer, but:
   - Status sensor: `sensor.dryer_current_status`
   - `paused_states`: `pause,sleep` *(treat sleep as still paused)*
+  - `sleep_state`: `sleep` *(triggers wake-then-resume on resume)*
+  - `wake_option`: `wake_up` *(LG UI: "Sleep Mode off")*
+  - `wake_delay_seconds`: `5`
   - Operation select: `select.dryer_operation`
   - Paused flag: `input_boolean.dryer_paused_by_solar`
   - Remote-start sensor: `binary_sensor.dryer_remote_start`
@@ -177,6 +189,9 @@ You'll get a notification suggesting you pause it manually.
 - **Resume command was rejected.** If you have an LG washer/dryer with
   Remote Start, configure `remote_start_sensor` so the blueprint won't
   try to send commands while Remote Start is disarmed.
-- **Dryer didn't recover from `sleep`.** Known LG limitation in the
-  simplified version. Either resume manually, or re-introduce keepalive
-  logic (not included here).
+- **Dryer didn't recover from `sleep`.** Verify all four sleep-handling
+  inputs are set on the dryer instance: `paused_states` includes
+  `sleep`, `sleep_state` is `sleep`, `wake_option` is `wake_up`, and
+  `wake_delay_seconds` is at least 3. If status had progressed beyond
+  `sleep` to `power_off` before production returned, the cycle is lost
+  and the dryer must be restarted at the panel.
