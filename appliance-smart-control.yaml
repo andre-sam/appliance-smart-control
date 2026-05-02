@@ -14,11 +14,14 @@ blueprint:
 
     Logic:
       • If the appliance is RUNNING and live production has been BELOW
-        `production_threshold` for `dwell_minutes`, pause it and flag
+        `pause_threshold` for `dwell_minutes`, pause it and flag
         that WE paused it.
       • If the appliance is PAUSED (by us) and live production has been
-        ABOVE `production_threshold` for `dwell_minutes`, resume it.
+        ABOVE `resume_threshold` for `dwell_minutes`, resume it.
       • If the user manually resumes or the cycle ends, clear the flag.
+
+    Using a higher `resume_threshold` than `pause_threshold` (hysteresis)
+    avoids flip-flopping around a single boundary on partly cloudy days.
 
 
     Pause action is configurable per appliance:
@@ -112,12 +115,26 @@ blueprint:
           domain: sensor
           device_class: power
 
-    production_threshold:
-      name: Production threshold (W)
+    pause_threshold:
+      name: Pause threshold (W)
       description: >
-        Pause when production drops BELOW this. Resume when it
-        rises ABOVE this.
-      default: 1000
+        Pause when live production drops BELOW this for `dwell_minutes`.
+      default: 1500
+      selector:
+        number:
+          min: 0
+          max: 10000
+          step: 50
+          unit_of_measurement: W
+          mode: box
+
+    resume_threshold:
+      name: Resume threshold (W)
+      description: >
+        Resume when live production rises ABOVE this for `dwell_minutes`.
+        Should be higher than `pause_threshold` to add hysteresis and
+        prevent flip-flopping.
+      default: 3000
       selector:
         number:
           min: 0
@@ -285,16 +302,16 @@ trigger:
   - platform: state
     entity_id: !input status_sensor
     id: status_change
-  # React when production crosses the threshold (with dwell built in).
+  # React when production crosses the thresholds (with dwell built in).
   - platform: numeric_state
     entity_id: !input production_sensor
-    below: !input production_threshold
+    below: !input pause_threshold
     for:
       minutes: !input dwell_minutes
     id: production_low
   - platform: numeric_state
     entity_id: !input production_sensor
-    above: !input production_threshold
+    above: !input resume_threshold
     for:
       minutes: !input dwell_minutes
     id: production_high
@@ -308,7 +325,8 @@ variables:
   min_remaining_minutes: !input min_remaining_minutes
 
   production_sensor: !input production_sensor
-  production_threshold: !input production_threshold
+  pause_threshold: !input pause_threshold
+  resume_threshold: !input resume_threshold
   dwell_minutes: !input dwell_minutes
 
   pause_mode: !input pause_mode
@@ -366,8 +384,8 @@ variables:
 
   # --- production ---
   production_w: "{{ states(production_sensor) | float(0) }}"
-  production_low_now:  "{{ production_w <  production_threshold }}"
-  production_high_now: "{{ production_w >= production_threshold }}"
+  production_low_now:  "{{ production_w <  pause_threshold }}"
+  production_high_now: "{{ production_w >= resume_threshold }}"
 
   # --- remote start gate ---
   remote_start_ok: "{{ (not has_remote_start) or is_state(remote_start_sensor, 'on') }}"
@@ -425,8 +443,8 @@ action:
                         Paused {{ appliance_friendly_name }} —
                         {%- endif %}
                         production {{ production_w | int }} W
-                        (< {{ production_threshold | int }} W).
-                        Will resume when production returns.
+                        (< {{ pause_threshold | int }} W).
+                        Will resume above {{ resume_threshold | int }} W.
 
       # ---------- RESUME ----------
       - conditions:
