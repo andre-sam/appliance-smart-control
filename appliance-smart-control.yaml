@@ -388,7 +388,11 @@ variables:
   production_high_now: "{{ production_w >= resume_threshold }}"
 
   # --- remote start gate ---
-  remote_start_ok: "{{ (not has_remote_start) or is_state(remote_start_sensor, 'on') }}"
+  # Only meaningful for `select_option` mode (commands go through the LG
+  # ThinQ API). `switch_off` cuts power at a smart plug, and `notify_only`
+  # doesn't talk to the appliance at all — neither cares whether Remote
+  # Start is armed.
+  remote_start_ok: "{{ pause_mode != 'select_option' or (not has_remote_start) or is_state(remote_start_sensor, 'on') }}"
 
   # --- flag ---
   paused_by_us: "{{ is_state(paused_flag, 'on') }}"
@@ -407,8 +411,7 @@ action:
           - "{{ production_low_now }}"
           - "{{ remaining_ok_to_pause }}"
           - "{{ not paused_by_us }}"
-          # For commanded modes the appliance must be reachable.
-          - "{{ pause_mode == 'notify_only' or remote_start_ok }}"
+          - "{{ remote_start_ok }}"
         sequence:
           # Only flip the "we paused this" flag when we actually act.
           - choose:
